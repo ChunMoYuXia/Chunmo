@@ -21,7 +21,7 @@
 - **多模型预测**：逻辑回归 / XGBoost / LightGBM 时序交叉验证赛跑，冠军模型输出上涨概率 + AI 风控建议
 - **工程化**：双数据源容灾、数据缓存、LLM 失败降级兜底、一键打包 exe
 
-目录：[doc-量化AI项目](<Project 1(量化AI)/doc-量化AI项目>)（项目文档）· [project](<Project 1(量化AI)/project>)（代码，含详细 README）
+目录：[project](<Project 1(量化AI)/project>)（代码，含详细 README）
 
 快速开始：
 
