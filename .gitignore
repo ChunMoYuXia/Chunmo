@@ -1,0 +1,44 @@
+# ── Python ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ── 虚拟环境 ────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / 编辑器 ────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── 敏感配置（绝不提交 API 钥匙）────────────────
+*.env
+!*.env.example
+config/keys.env
+
+# ── 生成物与缓存 ────────────────────────────────
+# Project 1 行情缓存、导出报告、日志
+data/
+exports/
+logs/
+# PyInstaller 打包产物
+build/
+dist/
+*.spec.bak
+# 大体积临时文件
+chart.html
+
+# ── Project 3(Hok)：gamecore 专有程序（含 license.dat，绝不提交）──
+Project 3(Hok)/hok_env_gamecore_*/
+
+# ── 操作系统 ────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
