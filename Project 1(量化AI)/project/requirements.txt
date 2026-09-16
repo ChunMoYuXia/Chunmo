@@ -1,0 +1,32 @@
+# QuantAI 依赖清单
+# 安装：pip install -r requirements.txt
+
+# 数据获取
+baostock>=0.8.8
+akshare>=1.10.0
+
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 可视化
+plotly>=5.15.0
+matplotlib>=3.7.0
+
+# Web 界面
+streamlit>=1.30.0
+
+# HTTP 请求
+requests>=2.28.0
+
+# 机器学习（项目二）
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+lightgbm>=4.0.0
+
+# 导出（可选，不装也能运行，只是 PDF 导出降级）
+weasyprint>=60.0
+reportlab>=4.0.0
+
+# 打包 exe（可选）
+pyinstaller>=6.0.0

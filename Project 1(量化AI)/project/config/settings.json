@@ -1,0 +1,50 @@
+{
+  "indicators": {
+    "ma_windows": [
+      5,
+      10,
+      20
+    ],
+    "rsi_window": 14,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "boll_window": 20,
+    "boll_std": 2.0,
+    "kdj_n": 9,
+    "kdj_m1": 3,
+    "kdj_m2": 3
+  },
+  "chart": {
+    "show_volume": true,
+    "show_rsi": true,
+    "show_macd": true,
+    "show_kdj": false,
+    "show_boll": true,
+    "show_ma": true,
+    "height": 900
+  },
+  "report": {
+    "max_words": 300,
+    "style": "要点式",
+    "include_rating": true
+  },
+  "cache": {
+    "enabled": true,
+    "ttl_days": 7
+  },
+  "data": {
+    "primary": "baostock"
+  },
+  "ml": {
+    "default_models": [
+      "逻辑回归",
+      "XGBoost",
+      "LightGBM"
+    ],
+    "n_splits": 5,
+    "lstm_hidden": 64,
+    "lstm_layers": 2,
+    "lstm_epochs": 50
+  }
+}
