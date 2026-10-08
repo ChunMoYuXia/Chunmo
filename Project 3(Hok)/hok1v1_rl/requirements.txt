@@ -1,0 +1,45 @@
+# Core deps for Phase 1-2
+#
+# ⚠️ Python 版本：必须是 3.6 <= py < 3.10，**推荐 3.9**。
+#   - hok_env 的 setup.py 声明 python_requires=">=3.6, <3.10"，
+#     且原生扩展只有 cpython-36m/37m/38/39 四个 ABI（没有 cpython-310）。
+#   - 3.8 也能加载 .so，但 **cu128 的 torch 轮子不含 cp38**
+#     （cu124 最高 2.6.0；cu126/cu128 最低 cp39），
+#     而 RTX 5070 是 Blackwell sm_120，必须用 cu128 的 torch（>=2.7）。
+#   - 因此 3.9 是唯一同时满足"能加载 .so"与"能用 sm_120 GPU"的版本。
+#
+# 安装（先激活 py3.9 环境）：
+#   conda create -n hok python=3.9
+#   conda activate hok
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+#   pip install -r requirements.txt
+#   # hok_env 本体（提供 hok 包）：
+#   cd ~/hok/hok_env/hok_env && pip install -e .
+#
+# GPU 自检（必须打印出 sm_120，且真实 kernel 能跑）：
+#   python -c "import torch; print(torch.cuda.get_arch_list()); \
+#              a=torch.randn(512,512,device='cuda'); print((a@a).sum().item())"
+
+# torch 不在此处声明版本：必须显式指定 CUDA 索引（见上方安装命令），
+# 直接写 "torch>=2.7" 有可能从 pypi 拉到不含 sm_120 的默认轮子。
+# torch>=2.7
+
+numpy>=1.24
+pyyaml>=6.0
+tensorboard>=2.14
+
+# Optional (WandB sync, off by default)
+wandb>=0.16
+
+# --- hok_env 运行期依赖（官方 hok.egg-info/requires.txt）---
+# 缺 loguru 会导致 `import hok.hok1v1.env1v1` 直接失败。
+loguru
+requests
+
+# --- aiarena actor / 数据落盘相关 ---
+# 只用本项目自己的 EnvRunner 时不是必需，但官方 actor 与 h5 采样需要。
+h5py
+pyzmq
+
+# --- hok_env 本体不在 pypi 上单独安装，必须源码可编辑安装 ---
+#   cd ~/hok/hok_env/hok_env && pip install -e .

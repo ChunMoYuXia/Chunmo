@@ -1,0 +1,163 @@
+# HoK 1v1 RL —— 针对 RTX 5070 12G VRAM / 32G RAM 的保守预设
+#
+# ⚠️ 环境前提（详见 hok1v1_rl/config.py 顶部与 requirements.txt）
+#   * Python 3.9       —— hok_env 原生扩展只支持 3.6–3.9；
+#                         3.8 加载得了 .so 但装不了 cu128 的 torch。
+#   * torch >= 2.7 + cu128 —— RTX 5070 是 Blackwell sm_120，
+#                         cu124 最高只到 2.6.0，没有 sm_120 kernel，
+#                         会在真正跑 kernel 时报 "no kernel image is available"。
+#   * gamecore-server 在 Windows 侧监听 23432，且 zmq 端口段（见 env.zmq_port_begin）已放行。
+#
+# 任何参数调整都要考虑单机 VRAM 上限，避免 OOM。
+
+hardware:
+  # 显存阈值：低于 warn 仅记录日志，达到 degrade 触发降级回调，达到 oom 视为即将 OOM
+  # 注意：官方 RTX 5070 实测 12227 MiB（≈11.94 GiB），且 PyTorch 缓存分配器
+  # 会额外 reserved 一部分，11.5 这个 oom 阈值已相当激进，建议先观察再收紧。
+  vram_total_gb: 12.0       # RTX 5070 标称显存上限
+  vram_warn_gb: 9.0         # 警告阈值：仅记录，不动作
+  vram_degrade_gb: 10.5     # 降级阈值：触发 degrade_callback（当前实现=缩小 minibatch_size）
+  vram_oom_gb: 11.5         # OOM 临界值：达到即抛错并建议收缩规模
+  ram_total_gb: 32.0        # 系统内存上限
+
+train:
+  backend: pytorch          # 深度学习后端，仅支持 PyTorch
+  # ⚠️ 关闭 AMP：网络仅约 5M 参数、minibatch 只 1024 帧，12G 显存用不上
+  # 混合精度；而 AMP 会让采样侧(fp32)与训练侧(fp16)对同一帧算出不同 logits，
+  # 使 old/new log prob 在参数未更新时 ratio 也 != 1，污染 KL 诊断。
+  # 关掉后"第一个 minibatch 的 ratio 应恒等于 1"才是可用的自检。
+  amp: false
+  grad_clip: 0.5            # 与 ppo.max_grad_norm 同义（实际生效的是后者）
+  seed: 42                  # 全局随机种子，由 train_ppo 在启动时真正设置
+  log_dir: ./logs           # 本地日志根目录（含 metrics.jsonl 与 checkpoint）
+  tb_log_dir: ./logs/tb     # TensorBoard 事件文件目录
+  wandb_project: hok1v1_rl  # WandB 项目名（wandb_enabled=false 时不生效）
+  wandb_enabled: false      # 单机调试阶段先关闭
+  log_interval_steps: 50    # 每多少次 update 打印一次训练指标
+  save_interval_steps: 200  # 每多少步保存一次 checkpoint（ckpt_step_{n}.pt）
+  # ⚠️ 评估闭环（本轮改动）：旧值 200 步 × 2 局时，
+  #    (1) 短测（total-steps=2~3）**从未触发过评估** —— eval/win_rate 在日志里
+  #        一次都没出现过，等于没有评估；
+  #    (2) 即便触发，2 局的胜率标准差 ≈0.35，根本无法判断"有没有变好"。
+  #    现在 batch_size=8192（≈3~4 局/update），50 步 ≈ 150~200 局，
+  #    取 10 局评估的开销可接受（评估走 deterministic，不打入训练 batch）。
+  eval_interval_steps: 50   # 每多少步做一次确定性评估（不打入训练 batch）
+  eval_episodes: 10         # 每次评估的对局数（2 局的统计噪声过大）
+  dashboard_port: 8600      # 实时看板 scripts/dashboard.py 的默认端口
+
+env:
+  # 字段语义已修正以匹配官方 HoK1v1 构造签名：
+  #   HoK1v1(runtime_id, game_launcher, lib_processor, addrs,
+  #          eval_mode=False, predict_frequency=3, aiserver_ip="127.0.0.1")
+  # addrs 是"每个玩家一个"的 zmq 地址，1v1 用两个连续端口。
+  num_envs: 1               # 当前 EnvRunner 只实现单环境（多环境需 fork 子进程）
+  player_num: 2             # HoK1v1.PLAYER_NUM，1v1 固定 2
+  # 运行时标识，gamecore 侧拼进 game_id（kaiwu- 前缀）。
+  # 禁止含 '_'：模拟器会拒绝该 game_id 并直接退出，对局无法开始。
+  runtime_id: "hok1v1rl-train"
+  gamecore_server_addr: "127.0.0.1:23432"   # Windows 侧 gamecore-server 地址
+  # gamecore（Windows 侧）连回本机 zmq 的 IP，zmq 也绑定在该 IP 上。
+  # 127.0.0.1 在 WSL2 两种网络模式下都可用（NAT 走 localhost 转发，
+  # 镜像模式走共享回环）。gamecore 跑在远端机器时改为本机局域网 IP。
+  # 留空 = 自动探测：镜像模式下会探测到 Windows 自己的适配器 IP，
+  # Windows 连回该 IP 会 SYN 挂起，对局无法开始，不推荐使用。
+  ai_server_addr: "127.0.0.1"
+  zmq_port_begin: 35150     # addrs 起始端口：player i -> tcp://{ai_server_addr}:{begin+i}
+  gamecore_req_timeout: 3000  # GamecoreClient 请求超时（毫秒）
+  max_frame_num: 20000      # 单局最大帧数，超过按截断处理，防止卡死局
+  predict_frequency: 3      # 每 N 帧决策一次（由 env 内部按帧号取模实现）
+  use_common_ai_opponent: true  # 对手交给内置 common_ai；1v1 单智能体训练必须为 true
+  # 时间惩罚：每步常数 -coef。归一化奖励下 0.001*3370 步 ≈ -3.4，
+  # 相对"一座基地=10 / 胜负=50"是温和的"尽快结束"激励。
+  reward_time_coef: 0.001
+
+network:
+  # ⚠️ 725 = 705(gamecore 原始观测) + 20(英雄身份 one-hot)。
+  #    官方 aiarena/1v1/actor/custom.py::append_hero_identity 会把我方英雄 id
+  #    转成 20 维 one-hot 追加到观测末尾，网络里的 global 段因此是 25 维
+  #    （5 game_time + 20 英雄身份）。已用 probe_diag.py 实测：环境给的是 705。
+  #    本项目每局轮换英雄，缺这 20 维策略就不知道自己在玩谁。
+  feature_dim: 725
+  use_hero_identity: true   # 由 env_runner.build_observation 追加那 20 维
+  legal_action_dim: 84      # 训练样本中的压缩 legal_action 维度（官方 SERI_VEC_SPLIT_SHAPE[1]）
+  lstm_hidden: 512          # LSTM 隐状态维度，与官方 baseline 一致
+  lstm_time_steps: 16       # BPTT 截断长度 / chunk 大小，与官方 LSTM_TIME_STEPS 一致
+  attn_heads: 4             # Self-Attention 头数（本项目增强项）
+  attn_d_ff: 1024           # Feed-forward 中间维度
+  # ⚠️ 必须 0：采样侧 eval() 关 dropout、训练侧 train() 开 dropout，
+  # 两侧就不是同一个函数了；而 KL 估计量 (exp(d)-1-d) 恒 >= 0，
+  # 零均值噪声也会单调抬高测得的 KL，直接触发早停。
+  attn_dropout: 0.0
+  # ⚠️ 必须 false：时间维 attention 在采样侧(T=1)退化为恒等映射、
+  # 训练侧(T=16)才跨帧聚合，old/new log prob 来自不同函数，
+  # PPO 的 ratio / KL / value_clip 全部失真。详见 network.py 顶部说明。
+  use_time_attention: false
+  label_size_list: [12, 16, 16, 16, 16, 8]  # 6 头分层动作空间
+  value_heads: ["hp", "money", "tower", "kill", "dead", "win"]  # 6 头 Multi-head Value（增强项）
+  target_embed_dim: 32      # target 头 embedding 维度，与官方 TARGET_EMBED_DIM 一致
+
+ppo:
+  # 取值与官方 aiarena/1v1/common/config.py 对齐
+  gamma: 0.995              # 官方 GAMMA
+  lamda: 0.95               # 官方 LAMDA
+  clip_param: 0.2           # 官方 CLIP_PARAM
+  ratio_clamp_low: 0.0      # 官方 ratio.clamp(0.0, 3.0)
+  ratio_clamp_high: 3.0
+  # ⚠️ 熵系数 0.01（**不是**官方默认的 0.025）—— 实测调参，非对齐官方。
+  #    依据：60 步长跑里 train/entropy 长期钉在 1.92~2.01（接近混合动作分布的
+  #    上限），而 train/kl 只有 1e-4 量级 → 熵项压过了 advantage 信号，
+  #    策略几乎没被推动。官方 0.025 是在别的配置下调出来的。
+  #    若 train/entropy 崩到 < 0.3，把 start/end 一起回调（保持相等 = 恒定）。
+  entropy_beta_start: 0.01
+  entropy_beta_end: 0.01    # = start，即不退火
+  value_coef: 0.5
+  # 官方 value loss 就是 0.5*mean((return-V)^2)，没有 value clipping。
+  # 关闭它可去掉"old_values 与新值不同源"这个风险点。
+  value_clip: false
+  # ⚠️ 改为 false（**官方全程没有归一化**）—— 实测调参。
+  #    原 RunningRewardNormalizer 用**全局运行** mean/var，有两个副作用：
+  #      ① 同一个 return 在不同 batch 里回归目标不同（早期统计量还在漂移）；
+  #      ② explained_variance 的分子用去均值后的 returns、分母却是原始尺度，
+  #         基准不一致 → 该指标失去意义（实测长期贴 0、个别步 −146）。
+  normalize_returns: false
+  # ⚠️ 3e-4（**不是**官方的 1e-4）—— 实测调参。
+  #    依据：train/kl 只有 1e-4 量级、clip_fraction 0.01%，
+  #    而健康 PPO 的 KL 应在 5e-3~2e-2 → 策略几乎没被推动。
+  #    官方 1e-4 是在 batch 大 4 倍的配置下调出来的。
+  #    若 train/kl 冲上 0.02 或 early_stopped 频繁，就回调到 1e-4。
+  lr: 3.0e-4
+  lr_end: 3.0e-4            # = lr，即不退火
+  # SGD 结构（已对齐官方 batch 规模：8192 决策/次更新）。
+  #    官方参考：512 条 16 帧序列 = 8192 决策，每个 batch 做 1 次 optimizer.step()
+  #    （apd_benchmark._do_train；common.conf 里没有 num_sgd_epoch/minibatch 键）。
+  # ⚠️ 这里 ppo_epochs=2（**不是**官方的 1）—— 实测调参。
+  #    原因：本项目的 batch 只有 4~5 局（~8192 决策）且连续对局高度相关，
+  #    有效样本量约为官方的 1/4；同一批数据多跑 1 个 epoch 可提高样本复用、
+  #    降低 advantage 方差。minibatch == batch，所以是"整批 × 2 次 SGD"。
+  ppo_epochs: 2
+  minibatch_size: 8192      # 以"帧"为单位；等于 batch_size 时整个 batch 一次更新
+  batch_size: 8192          # 单次 update 至少收集的决策数（= 官方 512×16）
+  kl_target: 0.015          # 软阈值：超过则跳过本 epoch 剩余 minibatch
+                            # ⚠️ 官方**没有** KL 早停。样本量小时该阈值会随机
+                            #    砍掉梯度步；长跑若见 early_stopped 频繁，
+                            #    考虑调大 kl_target 或关闭早停。
+  kl_max: 0.05              # 硬阈值：超过立即终止整个 update
+  max_grad_norm: 0.5        # 梯度范数裁剪阈值
+
+bc:
+  # Behavior Cloning：用专家轨迹预训练（Phase 3，尚未实现）
+  enabled: false
+  lr: 1.0e-3
+  alpha_start: 1.0
+  alpha_end: 0.0
+  alpha_decay_steps: 10000000
+
+self_play:
+  # Self-Play 模型池（Phase 4，尚未实现）
+  enabled: false
+  model_pool_dir: ./model_pool
+  latest_ratio: 0.8
+  history_ratio: 0.2
+  snapshot_interval: 100
+  max_snapshots: 20
+  elo_k: 32
