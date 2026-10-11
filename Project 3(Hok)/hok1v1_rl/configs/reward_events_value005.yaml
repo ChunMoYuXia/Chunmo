@@ -1,0 +1,26 @@
+# 单变量候选：与 reward_events.yaml 相比仅将 value_coef 从 0.5 降为 0.05。
+# 2026-10-11 对照短训退化：6/80→4/80 胜，暂不采用；保留用于复现。
+train:
+  eval_interval_steps: 20
+  eval_episodes: 40
+ppo:
+  grad_clip_mode: separate
+  value_coef: 0.05
+action:
+  rule: targeted_attack_v1
+  targeted_attack_hero_ids: [112, 133, 169]
+reward:
+  money: 0.0
+  hp: 0.0
+  economy_diff: 0.5
+  damage_dealt: 1.0
+  damage_taken: -0.75
+  last_hit: 0.02
+  win_speed: 3.0
+  exp: 0.0
+  ep: 0.0
+  kill: 2.0
+  dead: -2.0
+  tower: 10.0
+  win: 50.0
+  lose: -50.0

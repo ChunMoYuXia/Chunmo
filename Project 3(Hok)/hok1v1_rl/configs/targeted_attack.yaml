@@ -1,0 +1,10 @@
+# 单因素候选：与 recovery_clip.yaml 只差普通射手的普攻目标约束。
+# 保留双方全部 20 英雄；关羽等特殊英雄仍使用 SDK 规则。
+train:
+  eval_interval_steps: 20
+  eval_episodes: 40
+ppo:
+  grad_clip_mode: separate
+action:
+  rule: targeted_attack_v1
+  targeted_attack_hero_ids: [112, 133, 169]

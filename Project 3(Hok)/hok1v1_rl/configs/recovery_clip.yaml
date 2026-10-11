@@ -1,0 +1,6 @@
+# 与 recovery_control.yaml 只差裁剪方式；英雄池、奖励、学习率和更新轮数相同。
+train:
+  eval_interval_steps: 20
+  eval_episodes: 40
+ppo:
+  grad_clip_mode: separate

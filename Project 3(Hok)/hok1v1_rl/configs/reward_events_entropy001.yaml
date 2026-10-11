@@ -1,0 +1,28 @@
+# 更新 24 权重出发的方向分布短测：相对 stage8_control 仅降低常数熵系数。
+# 训练、奖励、动作规则及评估安排与对照组相同。
+train:
+  save_interval_steps: 4
+  eval_interval_steps: 4
+  eval_episodes: 80
+ppo:
+  grad_clip_mode: separate
+  entropy_beta_start: 0.001
+  entropy_beta_end: 0.001
+action:
+  rule: targeted_attack_v1
+  targeted_attack_hero_ids: [112, 133, 169]
+reward:
+  money: 0.0
+  hp: 0.0
+  economy_diff: 0.5
+  damage_dealt: 1.0
+  damage_taken: -0.75
+  last_hit: 0.02
+  win_speed: 3.0
+  exp: 0.0
+  ep: 0.0
+  kill: 2.0
+  dead: -2.0
+  tower: 10.0
+  win: 50.0
+  lose: -50.0

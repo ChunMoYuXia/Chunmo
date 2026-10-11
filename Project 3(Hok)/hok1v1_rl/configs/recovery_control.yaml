@@ -1,0 +1,7 @@
+# 从同一个旧权重初始化，作为分组裁剪实验的对照。
+# 未列出的字段继承 Config 的默认值。
+train:
+  eval_interval_steps: 20
+  eval_episodes: 40
+ppo:
+  grad_clip_mode: global

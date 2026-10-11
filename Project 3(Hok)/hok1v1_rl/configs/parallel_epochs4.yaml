@@ -1,0 +1,9 @@
+# 与 recovery_clip.yaml 对照：只把每批 PPO 学习轮数从 2 改为 4。
+# 两组均用 --samplers 2，从同一模型 --init-from，各训练 20 次更新。
+# 未列出的字段继承 Config 默认值；不修改英雄池、奖励和学习率。
+train:
+  eval_interval_steps: 20
+  eval_episodes: 40
+ppo:
+  grad_clip_mode: separate
+  ppo_epochs: 4

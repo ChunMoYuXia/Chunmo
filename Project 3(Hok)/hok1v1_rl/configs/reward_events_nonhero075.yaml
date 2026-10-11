@@ -1,0 +1,27 @@
+# 更新 24 权重出发的单因素短测：仅增加存活期间非英雄受伤残差惩罚。
+# 对照为 reward_events_stage8_control.yaml；两组均以相同权重重新初始化。
+train:
+  save_interval_steps: 4
+  eval_interval_steps: 4
+  eval_episodes: 80
+ppo:
+  grad_clip_mode: separate
+action:
+  rule: targeted_attack_v1
+  targeted_attack_hero_ids: [112, 133, 169]
+reward:
+  money: 0.0
+  hp: 0.0
+  economy_diff: 0.5
+  damage_dealt: 1.0
+  damage_taken: -0.75
+  nonhero_damage_taken: -0.75
+  last_hit: 0.02
+  win_speed: 3.0
+  exp: 0.0
+  ep: 0.0
+  kill: 2.0
+  dead: -2.0
+  tower: 10.0
+  win: 50.0
+  lose: -50.0
