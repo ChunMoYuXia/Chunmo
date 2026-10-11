@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HoK · 强化学习训练室</title>
+  <link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script>
+</head>
+<body>
+<header><div class="nav wrap"><a class="brand" href="/">HoK<span> / RL LAB</span></a>
+  <nav aria-label="看板分区"><button data-tab="overview" class="active">训练概览</button><button data-tab="metrics">学习指标</button><button data-tab="heroes">英雄与对局</button><button data-tab="guide">怎样读图</button></nav>
+  <div class="nav-end"><span id="connection" role="status">连接中</span><button id="theme" class="icon" aria-label="切换明暗主题">◐</button></div>
+</div></header>
+<main class="wrap">
+  <div class="heading"><div><div class="eyebrow">HONOR OF KINGS · MULTI-HERO PPO</div><h1>让学习过程看得见<span class="live-dot"></span></h1><p>从每一局采样，到每一次策略更新。</p></div>
+    <label class="run-label">训练运行<select id="run" aria-label="选择训练运行"><option value="">等待运行目录</option></select></label>
+  </div>
+  <div id="error" class="notice error" role="alert" hidden></div>
+  <section class="status-panel"><div class="status-top"><div><span class="eyebrow">CURRENT RUN</span><h2 id="run-name">等待训练日志</h2><div id="phase" class="muted">看板每 2 秒读取一次本地文件</div></div><div class="progress-text"><strong id="update-count">—</strong><span class="muted">PPO 更新</span></div></div>
+    <progress id="progress" max="100" value="0" aria-label="累计 PPO 更新进度"></progress>
+    <div class="status-bottom"><span id="live-detail">尚无逐步遥测</span><span id="updated">—</span></div>
+  </section>
+  <section id="overview" class="view">
+    <div class="kpis" id="kpis"></div>
+    <div class="section-title"><h2>胜率与回报</h2><span>评估使用确定性动作，训练使用采样动作</span></div>
+    <div class="chart-grid" id="overview-charts"></div>
+    <div class="two-col"><article class="panel goal"><div class="eyebrow">TARGET / 90%</div><h2 id="goal-title">等待评估</h2><p id="goal-text">训练胜率用于看趋势；目标需用独立评估验证。</p><div id="evaluation-detail" class="mini-stats"></div></article>
+    <article class="panel"><div class="eyebrow">TRAINING HEALTH</div><h2>本次运行观察</h2><ul id="insights" class="insights"></ul></article></div>
+  </section>
+  <section id="metrics" class="view" hidden>
+    <div class="section-title"><h2>PPO 学习指标</h2><span>各指标独立坐标轴 · 点击图表放大</span></div>
+    <div class="chart-grid" id="metric-charts"></div>
+    <div class="two-col"><article class="panel"><div class="panel-head"><h3>奖励从哪里来</h3><span class="muted">最近一次更新 · 每局均值</span></div><div id="rewards" class="bars"></div><p class="caption">包含终局奖励。只看总回报可能掩盖经济、推塔和生存的变化。</p></article>
+    <article class="panel"><div class="panel-head"><h3>采样动作分布</h3><select id="action-head" aria-label="动作头"><option value="0">button</option><option value="1">移动 x</option><option value="2">移动 z</option><option value="3">技能 x</option><option value="4">技能 z</option><option value="5">目标</option></select></div><div id="actions" class="bars"></div><p class="caption">统计所有采样头；部分头由 button 掩码关闭，因此不等同于实际执行动作比例。</p></article></div>
+    <div class="section-title"><h2>按钮合法性与选择</h2><select id="button-mode" aria-label="按钮诊断模式"><option value="train">最近训练批次</option><option value="eval">最近一次快评</option></select></div>
+    <p class="caption">按真实决策统计。平均概率包含不合法时的 0；argmax 占比表示该按钮概率排第一的频率。两者不等同于实际选择比例。旧日志缺失时显示“—”。</p>
+    <article class="panel table-panel"><table><thead><tr><th>SDK 按钮</th><th>合法比例</th><th>平均概率</th><th>实际选择比例</th><th>argmax 占比</th></tr></thead><tbody id="button-table"></tbody></table></article>
+  </section>
+  <section id="heroes" class="view" hidden>
+    <div class="section-title"><h2>随机英雄覆盖</h2><select id="hero-mode" aria-label="英雄统计模式"><option value="train">训练累计</option><option value="eval">最近一次快评</option><option value="formal">最近独立评估</option></select></div>
+    <p class="caption" id="hero-note">按完整对局统计，未知与平局计入分母。少量样本只用于发现短板。</p>
+    <div class="side-grid" id="sides"></div>
+    <article class="panel table-panel"><table><thead><tr><th>己方英雄 ID</th><th>对局</th><th>胜 / 负</th><th>平 / 未知 / 截断</th><th>胜率</th><th>样本观察</th></tr></thead><tbody id="hero-table"></tbody></table></article>
+    <div class="section-title"><h2>最近对局</h2><span>最多 30 局 · 时间按浏览器本地时区显示</span></div>
+    <p class="caption">按开局时间定位 ABS；客户端 ID 可与配套 .stat 的 ClientID 核对，不等同于 ABS 文件名中的 game_id。旧日志估算开局以“≈”标记，仅有结束时间时会注明。悬停英雄或阵营查看控制方校验状态。</p>
+    <article class="panel table-panel"><table><thead><tr><th>开局时间</th><th>更新</th><th>模式</th><th>训练英雄 / 对手</th><th>训练 AI 阵营</th><th>结果</th><th>决策数</th><th>回报</th><th>客户端 ID</th></tr></thead><tbody id="episode-table"></tbody></table></article>
+  </section>
+  <section id="guide" class="view" hidden>
+    <div class="section-title"><h2>先看结果，再找原因</h2><span>给强化学习入门者的读图顺序</span></div>
+    <div class="guide-grid">
+      <article class="panel"><span class="guide-number">01</span><h3>胜率回答“会不会赢”</h3><p>训练会随机探索，所以训练胜率与 argmax 评估胜率可能不同。先看固定规则评估，再看各英雄和双方阵营。40 局快评波动很大；95% Wilson 区间表示统计不确定性，不能把 9 胜 10 局当成已稳定达到 90%。</p></article>
+      <article class="panel"><span class="guide-number">02</span><h3>奖励回答“在学什么”</h3><p>回报包含经济、伤害、击杀、死亡、建筑与终局等分量。回报升高而胜率不动时，检查是不是只学会刷局部奖励。训练奖励图展示每局均值，不是每步奖励。</p></article>
+      <article class="panel"><span class="guide-number">03</span><h3>KL 与裁剪观察更新幅度</h3><p>KL 衡量新旧策略差异，clip fraction 是进入 PPO 裁剪区的有效动作头比例。长期为零可能是更新很小，也可能是优势弱，不能单凭它决定调大学习率。结合熵、梯度与评估趋势判断。</p></article>
+      <article class="panel"><span class="guide-number">04</span><h3>熵观察探索，EV 观察估值</h3><p>熵表示有效动作头的随机程度，受合法动作数量影响。过早降低可能减少探索。explained variance 接近 1 表示价值预测解释了较多回报波动，低于 0 表示预测比常数基线还差；它不是胜率。</p></article>
+      <article class="panel"><span class="guide-number">05</span><h3>loss 不必一直下降</h3><p>强化学习中策略不断改变，采到的数据也随之改变。policy loss 的正负或 value loss 的短期上升不能直接判定训练好坏。横轴可切换更新数与真实决策数；决策数不包含 LSTM 的 padding。</p></article>
+      <article class="panel"><span class="guide-number">06</span><h3>先排查数据，再改超参数</h3><p>出现未知结果或 Python 截断时，先检查环境与终局判断。英雄样本不均衡时，先检查采样覆盖。旧运行没有逐步状态时，页面只会在对局或更新完成后变化，不代表训练卡死。</p></article>
+    </div>
+    <article class="panel"><h3>本地数据与评估范围</h3><p id="run-config" class="caption"></p><p class="caption">独立评估读取当前运行目录下 eval-*/summary.json。指标缺失显示“—”，不会编造数据。当前目标对手是 common AI，英雄池外和真人对战需另行评估。</p></article>
+  </section>
+  <div class="toolbar"><label>曲线窗口<select id="range"><option value="200">最近 200 次更新</option><option value="1000">最近 1000 次更新</option><option value="5000">最近 5000 次更新</option></select></label><label>横轴<select id="axis"><option value="step">PPO 更新</option><option value="env/total_env_steps">真实决策数</option></select></label><label>平滑 <input id="smooth" type="range" min="0" max="0.95" step="0.05" value="0.6"><output id="smooth-value">0.60</output></label><button id="pause">暂停刷新</button><button id="download">导出当前数据</button></div>
+  <footer><span>HoK / RL LAB · 本地训练观测</span><span>2s 自动刷新 · 原始曲线 + EMA · 悬停查看数值</span></footer>
+</main>
+<dialog id="chart-modal"><div class="panel-head"><h2 id="modal-title"></h2><button id="close-modal" class="icon" aria-label="关闭放大图表">×</button></div><div id="modal-chart"></div><p id="modal-note" class="caption"></p></dialog>
+<div id="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

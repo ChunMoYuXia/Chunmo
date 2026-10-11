@@ -1,0 +1,32 @@
+# 本地学习材料
+/学习笔记/
+
+# 模型、日志与诊断结果（保留在磁盘，上传时排除）
+/runs/
+/logs/
+/logs_p*/
+/review_20261010/
+/review_*/
+/config.json
+*.pt
+*.pt.tmp
+*.abs
+*.stat
+*.env
+!*.env.example
+
+# 外部 SDK、授权游戏引擎及其密钥只保留在本地
+/hok_env/
+/gamecore/
+/hok_env_gamecore_*/
+license.dat
+*.dll
+*.exe
+*.so
+
+# Python 缓存及原生扩展崩溃转储
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/core
+/core.*

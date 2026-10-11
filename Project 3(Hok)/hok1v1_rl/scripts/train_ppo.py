@@ -1,479 +1,382 @@
-"""PPO 训练入口。
-
-与原实现的关键差异：
-  * ``make_env`` 改用 ``env_runner.build_hok_env``（正确的官方签名 + addrs + 阵容迭代器）
-  * 用 ``EnvRunner.collect_trajectory`` 收集**真实轨迹**，不再用 ``torch.randn`` 假 batch
-  * 训练循环真正把轨迹喂给 ``PPOLearner.update``
-  * 启动时设置全局随机种子（``train.seed``，原实现是死配置）
-  * VRAM 降级回调只做"运行时确实可调"的事情（缩小 minibatch）
-
-运行::
-
-    conda activate hok                                  # Python 3.9
-    # 先在 Windows 侧启动 gamecore-server，并确保已跑通 scripts/test_env.py
-    python scripts/train_ppo.py --config configs/default.yaml --total-steps 1000
-"""
-
+"""训练入口：采样 → PPO → 定期评估 → 保存。请从项目根目录运行。"""
 import argparse
+from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
+import json
 import logging
+import os
+from pathlib import Path
+import platform
 import random
 import sys
 import time
-import traceback
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 import numpy as np
 import torch
-
-from hok1v1_rl.action_mask import LABEL_SIZE_LIST
-from hok1v1_rl.config import load_config
+import yaml
+from hok1v1_rl.config import Config, load_config, ENVIRONMENT_CONTRACT
 from hok1v1_rl.env_runner import EnvRunner, build_hok_env
-from hok1v1_rl.learner import PPOLearner
+from hok1v1_rl.evaluation import evaluate
+from hok1v1_rl.learner import PPOLearner, read_checkpoint
+from hok1v1_rl.live_status import LiveStatus
 from hok1v1_rl.logger import UnifiedLogger
 from hok1v1_rl.metrics_store import MetricsStore
 from hok1v1_rl.network import HoK1v1Network
-from hok1v1_rl.reward import REWARD_COMPONENT_NAMES
+from hok1v1_rl.policy_diagnostics import merge_policy_diagnostics
+from hok1v1_rl.behavior_diagnostics import BEHAVIOR_KEYS
+from hok1v1_rl.policy_analysis import action_advantages
+from hok1v1_rl.reward_diagnostics import summarize_reward_detection
+from hok1v1_rl.rollout import collect_batch
+from hok1v1_rl.parallel_sampler import ParallelSampler
 from hok1v1_rl.vram_guard import VRamGuard
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
 logger = logging.getLogger("train")
 
-#: 训练轨迹里所有需要拼 batch 的键（除 lstm_state_init 外都是 ndarray）
-#: ⚠️ ``head_weights`` 是官方样本里的 weight0..5（= sub_action_mask[选中的 button]），
-#: learner 用它屏蔽与该 button 无关的动作头。**必须一起转成 tensor 传进 update()**，
-#: 否则 head 屏蔽会静默失效（learner 会告警一次）。
-#: ⚠️ ``valid_mask`` 是 env_runner 为"尾部补齐成完整 chunk"打的标记
-#: （1=真实决策，0=补齐）。**同样必须透传**，否则 learner 会把补齐的 0
-#: 算进 Σw 归一化的分母，把真实样本的梯度稀释掉。
-_BATCH_KEYS = (
-    "features", "legal_actions", "actions", "log_probs",
-    "values", "rewards", "dones", "advantages", "returns",
-    "head_weights", "valid_mask",
-)
 
-
-def set_global_seed(seed: int):
-    """设置全局随机种子，保证实验可复现（原实现声明了 seed 但从未使用）。"""
+def set_global_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    logger.info("全局随机种子已设为 %d", seed)
 
 
-def make_vram_degrade_callback(learner_holder: dict):
-    """构造 VRAM 降级回调。
-
-    ⚠️ 只有"运行时确实可调"的东西才在这里动：
-      * ``ppo.minibatch_size`` —— learner 每次 update 时读取，可安全缩小
-      * 网络结构（attn_heads / lstm_hidden）与序列长度是**构造期**参数，
-        训练中无法收缩，所以不要假装能降它们。
-
-    返回的字符串会写进日志，便于确认降级是否真的生效。
-    """
-
-    def _cb(step: int, used_gb: float) -> str:
-        cfg = learner_holder.get("cfg")
-        if cfg is None:
-            return "cfg 未就绪，未做任何收缩"
-
-        old_mb = cfg.ppo.minibatch_size
-        new_mb = max(128, old_mb // 2)
-        if new_mb == old_mb:
-            return f"minibatch_size 已是下限 {old_mb}，未进一步收缩"
-
-        cfg.ppo.minibatch_size = new_mb
-        learner = learner_holder.get("learner")
-        if learner is not None:
-            # learner 每次 update 都重新读 cfg，无需额外同步
-            pass
-        logger.warning(
-            "VRAM 降级：minibatch_size %d -> %d（step=%d, used=%.2fG）",
-            old_mb, new_mb, step, used_gb,
-        )
-        return f"minibatch_size {old_mb} -> {new_mb}"
-
-    return _cb
+def select_device(requested):
+    if requested == "auto":
+        requested = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device(requested)
+    if device.type == "cuda":
+        # 真正执行一次 kernel，ABI/显卡架构问题在启动时暴露。
+        matrix = torch.ones(8, 8, device=device)
+        (matrix @ matrix).sum().item()
+    return device
 
 
-def collect_batch(runner: EnvRunner, cfg, min_frames: int):
-    """收集至少 ``min_frames`` 帧的轨迹，拼成一个 PPO batch。
+def append_json(path, record):
+    record = {"timestamp": datetime.now(timezone.utc).isoformat(), **record}
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
 
-    每局单独跑完（``collect_trajectory``），再把若干局的 chunk 沿 batch 维拼接。
-    只拼接 chunk 长度（T）相同的轨迹；长度不同的轨迹单独成 batch
-    （短于一个 chunk 的整局会产生变长 chunk，见 env_runner 的说明）。
-    """
-    episodes = []
-    total_frames = 0
-    t_eff = None
-    win_cnt = 0
 
-    while total_frames < min_frames:
-        traj = runner.collect_trajectory()
-        cur_t = traj["features"].shape[1]
+def write_manifest(directory, cfg, args, initialization=None):
+    """冻结本次配置、代码指纹和依赖信息，后续读日志时知道实际训练了什么。"""
+    with open(directory / "config.yaml", "w", encoding="utf-8") as stream:
+        yaml.safe_dump(cfg.to_dict(), stream, allow_unicode=True, sort_keys=False)
+    sources = list((ROOT / "hok1v1_rl").glob("*.py")) + list((ROOT / "scripts").glob("*.py")) + [ROOT / "config.json"]
+    hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(sources)}
+    data = {"created_at": datetime.now().astimezone().isoformat(), "python": platform.python_version(),
+            "torch": torch.__version__, "numpy": np.__version__, "args": vars(args),
+            "config": cfg.to_dict(), "environment_contract": ENVIRONMENT_CONTRACT,
+            "simulator_mode": "remote", "initialization": initialization or {"mode": "fresh"},
+            "source_sha256": hashes}
+    (directory / "manifest.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        if t_eff is None:
-            t_eff = cur_t
-        elif cur_t != t_eff:
-            # 长度不一致就不混拼，直接返回当前已收集的部分
-            logger.debug("chunk 长度 %d != %d，停止本次拼接", cur_t, t_eff)
-            if episodes:
-                break
 
-        episodes.append(traj)
-        total_frames += traj["features"].shape[0] * cur_t
-        win_cnt += int(bool(traj["win"]))
+def training_metrics(episodes, result, env_steps, elapsed, samples=None):
+    # 对局指标只看真正结束的整局；吞吐、动作与耗时只看本批新采到的片段。
+    samples = episodes if samples is None else samples
+    decisions = sum(e["episode_len"] for e in samples)
+    n = len(episodes)
+    metrics = {f"train/{key}": float(value) for key, value in asdict(result).items()}
+    metrics.update({"env/completed_games": n, "env/frames_per_update": decisions,
+                    "env/decisions_per_update": decisions, "env/total_env_steps": env_steps,
+                    "env/chunk_padded_steps": sum(e["chunk_padded_steps"] for e in samples),
+                    "sample/reward_per_decision": sum(e["reward"] for e in samples) / decisions,
+                    "res/fps": decisions / max(elapsed, 1e-8)})
+    metrics.update({f"detect/{key}": value for key, value in summarize_reward_detection(samples).items()
+                    if value is not None})
+    if n:
+        metrics.update({"env/win_rate": sum(e["win"] for e in episodes) / n,
+                        "env/avg_episode_len": sum(e["episode_len"] for e in episodes) / n,
+                        "env/avg_reward": sum(e["reward"] for e in episodes) / n,
+                        "env/truncated_rate": sum(e["truncated"] for e in episodes) / n,
+                        "env/unknown_rate": sum(e["outcome"] == "unknown" for e in episodes) / n})
+        for key in episodes[0]["reward_components"]:
+            metrics[f"env/reward/{key}"] = sum(e["reward_components"].get(key, 0) for e in episodes) / n
+    for head in range(6):
+        counts = np.sum([e["action_hist"][f"head_{head}"] for e in samples], axis=0)
+        for choice, count in enumerate(counts):
+            metrics[f"act_dist/head_{head}/{choice}"] = float(count / counts.sum())
+    diagnostic = merge_policy_diagnostics(samples)
+    if diagnostic:
+        for key in ("legal_rate", "probability_mean", "selection_rate", "greedy_rate"):
+            for button, value in enumerate(diagnostic[key]):
+                metrics[f"policy/button_{key}/{button}"] = value
+        metrics["policy/near_tie_rate"] = diagnostic["near_tie_rate"]
+        metrics["policy/idle_with_alternative_rate"] = diagnostic["idle_with_alternative_rate"]
+    for key in ("reset_seconds", "close_game_seconds", "start_game_seconds",
+                "inference_seconds", "env_step_seconds"):
+        metrics[f"res/{key}"] = sum(e.get("timings", {}).get(key, 0.0) for e in samples)
+    counts = {key: sum(e.get("state_diagnostics", {}).get(key, 0) for e in samples)
+              for key in ("position_known_decisions", "fountain_decisions", "hero_skill_attempts",
+                          "hero_skill_attempts_with_known_position", "hero_skill_attempts_in_fountain",
+                          "attack_attempts", "attack_without_enemy_target",
+                          "attack_target_constraint_decisions", "attack_button_blocked_decisions", *BEHAVIOR_KEYS)}
+    metrics.update({f"behavior/{key}": value for key, value in counts.items()})
+    if counts["position_known_decisions"]:
+        metrics["behavior/fountain_rate"] = counts["fountain_decisions"] / counts["position_known_decisions"]
+    if counts["hero_skill_attempts_with_known_position"]:
+        metrics["behavior/fountain_skill_attempt_rate"] = counts["hero_skill_attempts_in_fountain"] / counts["hero_skill_attempts_with_known_position"]
+    if counts["attack_attempts"]:
+        metrics["behavior/attack_without_enemy_target_rate"] = counts["attack_without_enemy_target"] / counts["attack_attempts"]
+    if counts["move_position_known_attempts"]:
+        metrics["behavior/move_observed_displacement_rate"] = counts["move_observed_displacements"] / counts["move_position_known_attempts"]
+    if counts["observed_frame_span"]:
+        for key in ("income_gain", "enemy_income_gain", "hero_damage_gain", "enemy_building_damage"):
+            metrics[f"behavior/{key}_per_1000_frames"] = counts[key] * 1000 / counts["observed_frame_span"]
+    return metrics
 
-    batch = {}
-    for k in _BATCH_KEYS:
-        batch[k] = torch.as_tensor(
-            np.concatenate([e[k] for e in episodes], axis=0), dtype=torch.float32
-        )
-    # actions 需要 long（gather 的 index）
-    batch["actions"] = batch["actions"].long()
 
-    # lstm_state_init: ((1,B,H), (1,B,H))，沿第 1 维（B）拼接
-    h = torch.cat([e["lstm_state_init"][0] for e in episodes], dim=1)
-    c = torch.cat([e["lstm_state_init"][1] for e in episodes], dim=1)
-    batch["lstm_state_init"] = (h, c)
-
-    # 看板统计：本批对局的奖励分量均值与 6 头动作计数（跨局求和）。
-    # ⚠️ 分量现在是**归一化后、已乘权重**的贡献，可直接横向比较谁在主导：
-    #    tower=-10 就是字面意思"丢了一整座基地"，win/lose=±50。
-    comp_sum = {name: 0.0 for name in REWARD_COMPONENT_NAMES}
-    comp_sum["time"] = 0.0      # 时间惩罚（step 里追加的分量）
-    comp_sum["truncate"] = 0.0  # 截断惩罚（达到 max_frame_num 时非零）
-    action_total = [np.zeros(s, dtype=np.int64) for s in LABEL_SIZE_LIST]
-    #: 终局可见性统计（P3 的哨兵）：确认"含 done=1 的终局步真的进了 batch"。
-    #: 历史 bug 是尾部被整段丢弃，那时这些东西根本无从观测。
-    n_decisions = 0
-    n_padded = 0
-    terminal_in_batch_cnt = 0
-    for e in episodes:
-        es = e["episode_stats"]
-        for name in REWARD_COMPONENT_NAMES:
-            comp_sum[name] += float(es["reward_components"][name])
-        comp_sum["time"] += float(es["reward_components"].get("time", 0.0))
-        comp_sum["truncate"] += float(es["reward_components"].get("truncate", 0.0))
-        for head_i, size in enumerate(LABEL_SIZE_LIST):
-            action_total[head_i] += np.asarray(
-                es["action_hist"][f"head_{head_i}"], dtype=np.int64
-            )
-        n_decisions += int(es.get("episode_len", 0))
-        n_padded += int(es.get("chunk_padded_steps", 0))
-        if es.get("terminal_in_batch"):
-            terminal_in_batch_cnt += 1
-        # 每一局都应当有终局步（自然结束 done=1，或截断时手动置 done=1），
-        # 所以"应有终局的局数"就等于局数本身。
-        episodes_expect_terminal = len(episodes)
-
-    stats = {
-        "frames": total_frames,
-        "episodes": len(episodes),
-        "win_rate": win_cnt / max(1, len(episodes)),
-        "avg_episode_len": float(np.mean([e["episode_len"] for e in episodes])),
-        # ---- 终局可见性（P3 的哨兵）----
-        "decisions": n_decisions,
-        "chunk_padded_steps": n_padded,
-        "valid_ratio": (
-            1.0 - n_padded / max(1, n_decisions + n_padded)
-        ),
-        "episodes_expect_terminal": episodes_expect_terminal,
-        "terminal_in_batch": terminal_in_batch_cnt,
-        "reward_components": {
-            name: comp_sum[name] / max(1, len(episodes))
-            for name in list(comp_sum)   # 含 time（时间惩罚）
-        },
-        "action_hist": {
-            f"head_{head_i}": action_total[head_i].tolist()
-            for head_i in range(len(LABEL_SIZE_LIST))
-        },
-    }
-    return batch, stats
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--total-steps", type=int, default=1000, help="目标累计 PPO 更新次数；续训从已保存次数继续")
+    parser.add_argument("--device", default="auto")
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume", help="严格恢复配置、Adam、计数和随机状态")
+    initialization.add_argument("--init-from", help="只加载旧权重，开启可修改 PPO 或动作约束的新实验")
+    parser.add_argument("--allow-reward-change", action="store_true",
+                        help="仅搭配 --init-from，显式允许奖励迁移并记录原/新权重")
+    parser.add_argument("--runtime-id")
+    parser.add_argument("--zmq-port", type=int)
+    parser.add_argument("--gamecore-addr")
+    parser.add_argument("--log-dir", help="新运行目录；默认自动创建 runs/时间戳")
+    parser.add_argument("--max-decisions", type=int, help="仅调试：每局采样上限，不建议长训设置")
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--minibatch-size", type=int)
+    parser.add_argument("--eval-interval", type=int, help="0 表示关闭训练中快评")
+    parser.add_argument("--eval-episodes", type=int, help="训练中快评局数；短测可设 2，正式训练默认 40")
+    parser.add_argument("--samplers", type=int, default=1, help="独立采样进程数；推荐先设 2，默认 1 保留串行模式")
+    parser.add_argument("--sampler-device", default="cpu", help="并行采样的推理设备，默认 cpu；PPO 仍使用 --device")
+    parser.add_argument("--sampler-inference", choices=("eager", "jit"), default="eager",
+                        help="jit 加速 CPU 单步推理；更换模式时用 --init-from 开启新运行")
+    parser.add_argument("--fragment-length", type=int, default=0,
+                        help="并行采样每个片段的决策上限；0=整局，推荐片段 512")
+    parser.add_argument("--burn-in", type=int, default=64,
+                        help="片段模式每次换权重后重放最近多少步来更新 LSTM 记忆")
+    return parser.parse_args()
 
 
 def main():
-    """训练入口：装配环境/网络/learner，然后跑 PPO 主循环。
-
-    一次 ``update`` 的流程（对应下面 for 循环里的 1)~6)）：
-      1) 采样：``collect_batch`` 反复调用 ``collect_trajectory`` 直到凑够
-         ``ppo.batch_size`` 个决策，把多个整局的 chunk 沿 batch 维拼起来
-      2) 标准化：advantage 做 batch 内 z-score；returns 走 RunningRewardNormalizer
-      3) 更新：``learner.update`` 按 ``ppo.ppo_epochs`` × minibatch 做 SGD
-      4) 评估：每 ``eval_interval_steps`` 步跑 ``eval_episodes`` 局确定性对局
-      5) 落盘：指标写 metrics.jsonl（看板数据源）
-      6) 存档：每 ``save_interval_steps`` 步存一次 checkpoint
-
-    ⚠️ ``--total-steps`` 是 **LR/熵退火的基准**，不是"跑够这么多就停"。当前
-    默认 ``lr_end == lr``、``entropy_beta_start == end``（都不退火，对齐官方），
-    所以传小值做短测也不再把学习率压到 0；但若日后重新打开退火，请把它设成
-    **计划步数的 2~3 倍**，否则跑完后段会失去学习能力。
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--total-steps", type=int, default=10000,
-                        help="PPO 更新总步数（每次 update 消费一个 batch）")
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--resume", default=None, help="从 checkpoint 恢复")
-    # ---- 并行运行所需的三组隔离参数 -------------------------------------
-    # 同一时间只允许一个进程用相同的 runtime_id（gamecore 侧按它区分对局），
-    # 且 zmq 端口段不能重叠；log-dir 必须隔离，否则多个实例会往同一个
-    # metrics.jsonl / checkpoint 目录里写，把指标混成一条乱曲线。
-    parser.add_argument("--runtime-id", default=None,
-                        help="覆盖 env.runtime_id（并行实例必须各不相同；不能含下划线）")
-    parser.add_argument("--zmq-port", type=int, default=None,
-                        help="覆盖 env.zmq_port_begin（并行实例必须错开，每个实例占 2 个连续端口）")
-    parser.add_argument("--gamecore-addr", default=None,
-                        help="覆盖 env.gamecore_server_addr（跑多个 gamecore-server 时用）")
-    parser.add_argument("--log-dir", default=None,
-                        help="覆盖 train.log_dir（并行实例必须隔离，存 metrics.jsonl 与 ckpt）")
-    args = parser.parse_args()
-
-    cfg_path = Path(args.config)
-    if not cfg_path.is_absolute():
-        cfg_path = Path(__file__).resolve().parent.parent / cfg_path
-    cfg = load_config(str(cfg_path))
-
-    # CLI 覆盖必须在这里做：下面的 UnifiedLogger / MetricsStore / build_hok_env
-    # 都会读 cfg，晚于这一步就晚了（尤其 log_dir 决定 metrics.jsonl 落哪）。
-    overrides = []
-    if args.runtime_id:
-        cfg.env.runtime_id = args.runtime_id
-        overrides.append("env.runtime_id=%s" % args.runtime_id)
-    if args.zmq_port is not None:
-        cfg.env.zmq_port_begin = args.zmq_port
-        overrides.append("env.zmq_port_begin=%d" % args.zmq_port)
-    if args.gamecore_addr:
-        cfg.env.gamecore_server_addr = args.gamecore_addr
-        overrides.append("env.gamecore_server_addr=%s" % args.gamecore_addr)
-    if args.log_dir:
-        cfg.train.log_dir = args.log_dir
-        cfg.train.tb_log_dir = str(Path(args.log_dir) / "tb")
-        overrides.append("train.log_dir=%s" % args.log_dir)
-
-    logger.info("配置已从 %s 加载", cfg_path)
-    if overrides:
-        logger.info("命令行覆盖：%s", "  ".join(overrides))
-    logger.info(
-        "num_envs=%d batch_size=%d minibatch_size=%d seq_len=%d amp=%s",
-        cfg.env.num_envs, cfg.ppo.batch_size, cfg.ppo.minibatch_size,
-        cfg.network.lstm_time_steps, cfg.train.amp,
-    )
-
-    if cfg.env.num_envs != 1:
-        logger.warning(
-            "当前 EnvRunner 只实现单环境；cfg.env.num_envs=%d 将被忽略（按 1 运行）。"
-            "多环境需要为每个环境 fork 独立子进程（interface 是进程内单例）。",
-            cfg.env.num_envs,
-        )
-
+    args = parse_args()
+    allow_reward_change = getattr(args, "allow_reward_change", False)
+    if allow_reward_change and not args.init_from:
+        raise ValueError("--allow-reward-change 只能搭配 --init-from，不能改变严格续训的奖励")
+    if args.resume and not args.config:
+        cfg = Config.from_dict(read_checkpoint(args.resume)["config"])
+    else:
+        cfg = load_config(args.config or str(ROOT / "configs/default.yaml"))
+    for option, name in ((args.runtime_id, "runtime_id"), (args.zmq_port, "zmq_port_begin"),
+                         (args.gamecore_addr, "gamecore_server_addr"), (args.max_decisions, "max_decisions")):
+        if option is not None:
+            setattr(cfg.env, name, option)
+    for option, name in ((args.batch_size, "batch_size"), (args.minibatch_size, "minibatch_size")):
+        if option is not None:
+            setattr(cfg.ppo, name, option)
+    if args.eval_interval is not None:
+        cfg.train.eval_interval_steps = args.eval_interval
+    if args.eval_episodes is not None:
+        cfg.train.eval_episodes = args.eval_episodes
+    cfg.validate()
+    samplers = getattr(args, "samplers", 1)
+    sampler_device = getattr(args, "sampler_device", "cpu")
+    inference_mode = getattr(args, "sampler_inference", "eager")
+    fragment_length, burn_in = getattr(args, "fragment_length", 0), getattr(args, "burn_in", 64)
+    if fragment_length < 0 or (fragment_length and fragment_length % cfg.network.lstm_time_steps) or burn_in < 0:
+        raise ValueError("fragment-length 应为 0 或 LSTM 序列长度的正整数倍，burn-in >= 0")
+    if fragment_length and (samplers == 1 or cfg.env.max_decisions):
+        raise ValueError("片段采样需要 samplers >= 2，且不设置 max-decisions")
+    if not 1 <= samplers <= 8 or cfg.env.zmq_port_begin + 2*samplers - 1 > 65535:
+        raise ValueError("samplers 范围为 1..8，每个进程需要两个连续 ZMQ 端口")
+    eval_workers = min(samplers, max(2, cfg.train.eval_episodes)) if fragment_length and cfg.train.eval_interval_steps else 0
+    if cfg.env.zmq_port_begin + 2*(samplers+eval_workers) - 1 > 65535:
+        raise ValueError("片段模式还需要为独立评估进程预留连续 ZMQ 端口")
+    if torch.device(sampler_device).type not in ("cpu", "cuda"):
+        raise ValueError("sampler-device 只支持 cpu 或 cuda")
+    if args.total_steps <= 0:
+        raise ValueError("total-steps 必须为正")
+    run_base = Path(cfg.train.log_dir)
+    if not run_base.is_absolute():
+        run_base = ROOT / run_base
+    directory = Path(args.log_dir) if args.log_dir else run_base / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    # 不把多个训练会话追加到同一目录，避免曲线和配置混在一起。
+    directory.mkdir(parents=True, exist_ok=False)
+    cfg.train.log_dir, cfg.train.tb_log_dir = str(directory), str(directory / "tb")
     set_global_seed(cfg.train.seed)
-
-    # ---- 设备 ----
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    logger.info("设备：%s", device)
-    if device.type == "cuda":
-        cap = torch.cuda.get_device_capability(0)
-        logger.info("  GPU: %s capability=%s", torch.cuda.get_device_name(0), cap)
-        logger.info("  torch 架构列表: %s", torch.cuda.get_arch_list())
-        logger.info("  VRAM 总量: %.2f GB",
-                    torch.cuda.get_device_properties(0).total_memory / 1e9)
-        # 提前暴露 sm_120 不匹配问题（is_available() 为 True 也可能是假象）
-        try:
-            _t = torch.randn(64, 64, device=device)
-            _ = (_t @ _t).sum().item()
-            torch.cuda.synchronize()
-        except Exception as exc:      # noqa: BLE001
-            logger.error("GPU kernel 自检失败，请先修复 torch 版本：%s", exc)
-            sys.exit(1)
-
-    # ---- 构建模块 ----
+    device = select_device(args.device)
+    if inference_mode == "jit" and torch.device(sampler_device if samplers > 1 else device).type != "cpu":
+        raise ValueError("sampler-inference=jit 仅支持 CPU 采样")
+    torch.set_num_threads(min(4, os.cpu_count() or 1))
     network = HoK1v1Network(cfg).to(device)
-    logger.info("网络参数量：%.2f M", network.count_params() / 1e6)
-
-    unified_logger = UnifiedLogger(
-        tb_log_dir=cfg.train.tb_log_dir,
-        wandb_project=cfg.train.wandb_project,
-        wandb_enabled=cfg.train.wandb_enabled,
-        config=cfg.to_dict(),
-    )
-    metrics_store = MetricsStore(str(Path(cfg.train.log_dir) / "metrics.jsonl"))
-
-    learner_holder = {"cfg": cfg}
-    vram_guard = VRamGuard(
-        warn_gb=cfg.hardware.vram_warn_gb,
-        degrade_gb=cfg.hardware.vram_degrade_gb,
-        oom_gb=cfg.hardware.vram_oom_gb,
-        degrade_callback=make_vram_degrade_callback(learner_holder),
-    )
-
-    learner = PPOLearner(network, cfg, unified_logger, vram_guard)
-    learner.set_lr_schedule(total_steps=args.total_steps)
-    learner_holder["learner"] = learner
-
-    if args.resume:
-        learner.load(args.resume)
-
-    # ---- 构建环境 ----
+    guard = VRamGuard(cfg.hardware.vram_warn_gb, cfg.hardware.vram_degrade_gb, cfg.hardware.vram_oom_gb)
+    learner = PPOLearner(network, cfg, vram_guard=guard)
+    state = learner.load(args.resume) if args.resume else {}
+    saved_sampler = state.get("sampler_state")
+    if saved_sampler and (saved_sampler["workers"] != samplers or saved_sampler["device"] != sampler_device):
+        raise ValueError("并行续训需保持 samplers 和 sampler-device 一致；更换时请用 --init-from")
+    saved_inference = saved_sampler.get("inference_mode", "eager") if saved_sampler else state.get("sampler_inference", "eager")
+    if args.resume and saved_inference != inference_mode:
+        raise ValueError("严格续训需保持 sampler-inference 一致；更换时请用 --init-from")
+    if args.resume and ((saved_sampler or {}).get("fragment_length", 0) != fragment_length or
+            (fragment_length and (saved_sampler or {}).get("burn_in", 64) != burn_in)):
+        raise ValueError("严格续训需保持 fragment-length 和 burn-in 一致；更换时请用 --init-from")
+    if saved_sampler and saved_sampler.get("ongoing_games"):
+        logger.info("恢复模型与优化器；checkpoint 中 %d 局未结束的游戏不恢复，采样将从新局开始",
+                    len(saved_sampler["ongoing_games"]))
+    initialization = {"mode": "resume", "source_checkpoint": str(Path(args.resume).resolve()),
+                      "source_updates": learner._total_updates} if args.resume else {"mode": "fresh"}
+    if getattr(args, "init_from", None):
+        initialization = learner.initialize_from(args.init_from, allow_reward_changes=allow_reward_change)
+    learner.set_lr_schedule(args.total_steps)
+    if learner._total_updates >= args.total_steps:
+        raise ValueError("目标累计更新数必须大于 checkpoint 的已有更新数")
+    write_manifest(directory, cfg, args, initialization)
+    tb = UnifiedLogger(cfg.train.tb_log_dir, cfg.train.wandb_project, cfg.train.wandb_enabled, cfg.to_dict())
+    store = MetricsStore(str(directory / "metrics.jsonl"))
+    runner = None
+    env_steps, best_rate = state.get("env_steps", 0), state.get("best_rate", -1.0)
+    best_summary = state.get("best_summary")
+    status = LiveStatus(directory, phase="starting", target_updates=args.total_steps,
+                        completed_updates=learner._total_updates, device=str(device), env_steps=env_steps,
+                        sampler_count=samplers)
+    status.update(force=True)
+    final_phase = "finished"
+    logger.info("device=%s 参数=%.2fM run=%s 已完成更新=%d", device, network.count_params()/1e6, directory, learner._total_updates)
+    if samplers > 1:
+        logger.info("并行采样：%d 进程，推理设备=%s，推理模式=%s，ZMQ=%d..%d；每批同步权重后采样，全部返回后更新",
+                    samplers, sampler_device, inference_mode,
+                    cfg.env.zmq_port_begin, cfg.env.zmq_port_begin+2*samplers-1)
+        if fragment_length:
+            logger.info("连续片段：每段最多 %d 决策，burn-in=%d；评估使用独立 runtime 和后续端口",
+                        fragment_length, burn_in)
+    def checkpoint_state():
+        return {"env_steps": env_steps, "best_rate": best_rate, "best_summary": best_summary,
+                "sampler_inference": inference_mode,
+                "matchup_schedule": runner.schedule.state_dict() if runner else state.get("matchup_schedule"),
+                "sampler_state": runner.state_dict() if isinstance(runner, ParallelSampler) else saved_sampler}
     try:
-        env = build_hok_env(cfg, runtime_id=cfg.env.runtime_id)
-    except Exception as exc:      # noqa: BLE001
-        logger.error("环境初始化失败：%s: %s", type(exc).__name__, exc)
-        logger.error("请先启动 Windows 侧 gamecore-server，并运行 scripts/test_env.py 验证。")
-        sys.exit(1)
-
-    # camp_config=None 时 EnvRunner 内部按官方迭代器每局轮换英雄
-    runner = EnvRunner(env, network, cfg, device)
-
-    # ---- 训练循环 ----
-    logger.info("启动训练循环（total_steps=%d）...", args.total_steps)
-    fps_window = []
-    step = 0
-
-    try:
-        for step in range(args.total_steps):
-            t0 = time.time()
-
-            # 1) 采样：收集至少 batch_size 帧
-            batch, stats = collect_batch(runner, cfg, cfg.ppo.batch_size)
-
-            # 2) PPO 更新（可能因 VRAM OOM 抛错）
-            try:
-                result = learner.update(batch, step=step)
-            except RuntimeError as exc:
-                if "VRamGuard OOM" in str(exc):
-                    logger.error("OOM @ step %d：%s", step, exc)
-                    logger.error("建议：调小 ppo.minibatch_size 或 batch_size 后重跑。")
-                    break
-                raise
-
-            # 3) 吞吐与日志
-            dt = max(1e-6, time.time() - t0)
-            fps_window.append(stats["frames"] / dt)
-            if len(fps_window) > 50:
-                fps_window.pop(0)
-
-            unified_logger.log_fps(np.mean(fps_window), stats["frames"], step)
-            unified_logger.log_metrics({
-                "env/win_rate": stats["win_rate"],
-                "env/avg_episode_len": stats["avg_episode_len"],
-                "env/frames_per_update": stats["frames"],
-            }, step)
-
-            # 4) 周期性评估：确定性动作，不打入训练 batch
-            eval_metrics = {}
-            if (
-                step > 0
-                and cfg.train.eval_interval_steps > 0
-                and step % cfg.train.eval_interval_steps == 0
-            ):
-                eval_wins, eval_lens = [], []
-                for _ in range(cfg.train.eval_episodes):
-                    try:
-                        et = runner.collect_trajectory(deterministic=True)
-                    except Exception as exc:      # noqa: BLE001
-                        logger.warning("评估对局失败（跳过本次评估）：%s", exc)
-                        break
-                    eval_wins.append(int(et["win"]))
-                    eval_lens.append(int(et["episode_len"]))
-                if eval_wins:
-                    eval_metrics = {
-                        "eval/win_rate": sum(eval_wins) / len(eval_wins),
-                        "eval/avg_episode_len": float(np.mean(eval_lens)),
-                    }
-                    unified_logger.log_metrics(eval_metrics, step)
-
-            # 5) 写入指标存储（看板数据源，一步一行）
-            vram = vram_guard.check(step=step)
-            record = {
-                "train/policy_loss": result.policy_loss,
-                "train/value_loss": result.value_loss,
-                "train/entropy": result.entropy,
-                "train/kl": result.kl,
-                "train/grad_norm": result.grad_norm,
-                "train/lr": result.lr,
-                "train/clip_fraction": result.clip_fraction,
-                "train/explained_variance": result.explained_variance,
-                "train/entropy_beta": result.entropy_beta,
-                "env/win_rate": stats["win_rate"],
-                "env/avg_episode_len": stats["avg_episode_len"],
-                "env/frames_per_update": stats["frames"],
-                "res/fps": float(np.mean(fps_window)),
-                "res/vram_warn_gb": vram_guard.warn_gb,
-                "res/vram_degrade_gb": vram_guard.degrade_gb,
-                "res/vram_oom_gb": vram_guard.oom_gb,
-                **{f"res/{k}": v for k, v in vram.to_dict().items()},
-                **eval_metrics,
-            }
-            for name in REWARD_COMPONENT_NAMES:
-                record[f"env/reward/{name}"] = stats["reward_components"][name]
-            if "time" in stats["reward_components"]:
-                record["env/reward/time"] = stats["reward_components"]["time"]
-            # ⚠️ truncate 不在 REWARD_COMPONENT_NAMES 里（它不是 env 给的 8 分量之一，
-            # 而是达到 max_frame_num 时我们追加的惩罚）。旧代码因此**永远不记录它**，
-            # 导致"拖局被截断扣 -50"这件事在日志里完全不可见。
-            if "truncate" in stats["reward_components"]:
-                record["env/reward/truncate"] = stats["reward_components"]["truncate"]
-
-            # ---- 终局可见性 / 有效性（P3 的哨兵）----
-            record["env/chunk_padded_steps"] = stats["chunk_padded_steps"]
-            record["env/valid_ratio"] = stats["valid_ratio"]
-            record["env/terminal_in_batch"] = (
-                stats["terminal_in_batch"] / max(1, stats["episodes_expect_terminal"])
-            )
-            record["train/valid_ratio"] = result.valid_ratio
-            # 哨兵指标：采样侧与训练侧是不是同一个前向（正常 ≈1e-5，>0.05 就要停）。
-            # 它同时进 TB 与 metrics.jsonl，这样看板和日志都能盯它。
-            record["train/old_new_logp_gap"] = result.old_new_logp_gap
-
-            for head_i, hist in stats["action_hist"].items():
-                for a, cnt in enumerate(hist):
-                    record[f"env/act_dist/{head_i}/{a}"] = float(cnt)
-            metrics_store.add(step, record)
-
-            # 6) 周期性 checkpoint
-            if (
-                step > 0
-                and cfg.train.save_interval_steps > 0
-                and step % cfg.train.save_interval_steps == 0
-            ):
-                learner.save(str(Path(cfg.train.log_dir) / f"ckpt_step_{step}.pt"))
-
-            if step % cfg.train.log_interval_steps == 0:
-                logger.info(
-                    "step=%d frames=%d eps=%d win=%.2f | ploss=%.4f vloss=%.4f "
-                    "kl=%.4f ent=%.4f beta=%.4f gnorm=%.2f lr=%.2e mb=%d fps=%.1f",
-                    step, stats["frames"], stats["episodes"], stats["win_rate"],
-                    result.policy_loss, result.value_loss, result.kl,
-                    result.entropy, result.entropy_beta, result.grad_norm,
-                    result.lr, result.num_minibatches, float(np.mean(fps_window)),
-                )
-
+        if samplers > 1:
+            runner = ParallelSampler(cfg, network, samplers, sampler_device, saved_sampler,
+                                     inference_mode=inference_mode,
+                                     fragment_length=fragment_length, burn_in=burn_in)
+        else:
+            runner = EnvRunner(build_hok_env(cfg, cfg.env.runtime_id), network, cfg, device)
+            runner.prepare_inference(inference_mode)
+        runner.progress_callback = status.update
+        if state.get("matchup_schedule"):
+            runner.schedule.load_state_dict(state["matchup_schedule"])
+        while learner._total_updates < args.total_steps:
+            started = time.monotonic()
+            update = learner._total_updates + 1
+            status.update(force=True, phase="sampling", update=update, hero_id=None,
+                          episode_decisions=0, eval_completed=0)
+            def record_episode(game):
+                nonlocal env_steps
+                if not fragment_length:
+                    env_steps += game["episode_len"]
+                status.update(force=True, env_steps=env_steps)
+                append_json(directory / "episodes.jsonl", {"update": update, "mode": "train", **game})
+                logger.info("采样 hero=%s vs=%s side=%s result=%s decisions=%d", game.get("hero_id"), game.get("opponent_id"), game.get("player_id"), game["termination_reason"], game["episode_len"])
+            def record_sample(sample):
+                nonlocal env_steps
+                env_steps += sample["episode_len"]
+                status.update(force=True, env_steps=env_steps)
+                append_json(directory / "fragments.jsonl", {"update": update, "mode": "train", **sample})
+            if samplers > 1:
+                batch, episodes = runner.collect_batch(cfg.ppo.batch_size, learner._total_updates,
+                    record_episode, record_sample if fragment_length else None)
+            else:
+                batch, episodes = collect_batch(runner, cfg.ppo.batch_size, record_episode)
+            sampling_seconds = time.monotonic() - started
+            status.update(force=True, phase="updating")
+            updating_started = time.monotonic()
+            append_json(directory / "policy_updates.jsonl", {"update": update,
+                        "phase": "pre_update", **action_advantages(batch)})
+            result = learner.update(batch)
+            if samplers == 1 and inference_mode == "jit":
+                runner.prepare_inference(inference_mode)
+            updating_seconds = time.monotonic() - updating_started
+            status.update(force=True, completed_updates=learner._total_updates)
+            metrics = training_metrics(episodes, result, env_steps, time.monotonic() - started,
+                runner.collection_samples if fragment_length else None)
+            metrics.update({"res/sampling_seconds": sampling_seconds, "res/update_seconds": updating_seconds,
+                            "res/evaluation_seconds": 0.0, "res/sampler_processes": samplers})
+            if isinstance(runner, ParallelSampler):
+                metrics.update(runner.collection_metrics)
+            if fragment_length:
+                metrics.update({"sample/fragments": len(runner.collection_samples),
+                                "sample/fragment_length": fragment_length, "sample/burn_in": burn_in})
+            if device.type == "cuda":
+                metrics.update({"res/vram_used_gb": torch.cuda.memory_allocated(device) / 1024**3,
+                                "res/vram_reserved_gb": torch.cuda.memory_reserved(device) / 1024**3})
+            if cfg.train.eval_interval_steps and update % cfg.train.eval_interval_steps == 0:
+                evaluation_started = time.monotonic()
+                eval_count = 0
+                status.update(force=True, phase="evaluating", eval_completed=0,
+                              eval_target=cfg.train.eval_episodes, hero_id=None, episode_decisions=0)
+                def record_eval(game):
+                    nonlocal eval_count
+                    eval_count += 1
+                    status.update(force=True, eval_completed=eval_count)
+                    append_json(directory / "episodes.jsonl", {"update": update, "mode": "eval", **game})
+                    logger.info("评估 hero=%s side=%s outcome=%s", game["hero_id"], game["player_id"], game["outcome"])
+                if samplers > 1:
+                    summary = runner.evaluate(cfg.train.eval_episodes, learner._total_updates, record_eval)
+                else:
+                    summary = evaluate(runner, cfg.train.eval_episodes, on_episode=record_eval)
+                metrics["res/evaluation_seconds"] = time.monotonic() - evaluation_started
+                append_json(directory / "evaluations.jsonl", {"update": update, **summary})
+                metrics.update({"eval/win_rate": summary["win_rate"], "eval/games": summary["games"],
+                                "eval/unknown": summary["unknown"], "eval/ci95_lower": summary["win_rate_ci95"][0]})
+                diagnostic = summary.get("policy_diagnostics", {})
+                if diagnostic:
+                    metrics.update({"eval/none2_selection_rate": diagnostic["selection_rate"][1],
+                                    "eval/attack_selection_rate": diagnostic["selection_rate"][3],
+                                    "eval/attack_legal_rate": diagnostic["legal_rate"][3]})
+                if summary["unknown"] == 0 and summary["truncated"] == 0 and summary["win_rate"] > best_rate:
+                    best_rate, best_summary = summary["win_rate"], summary
+                    learner.save(directory / "best_ckpt.pt", checkpoint_state())
+            store.add(update, metrics)
+            tb.log_metrics(metrics, update)
+            if update % max(1, cfg.train.log_interval_steps) == 0:
+                win_text = f"{metrics['env/win_rate']*100:.1f}%" if episodes else "--"
+                reward_text = f"{metrics['env/avg_reward']:.2f}" if episodes else "--"
+                logger.info("update=%d env_steps=%d completed_games=%d train_win=%s reward=%s KL=%.5f optimizer_steps=%d",
+                            update, env_steps, len(episodes), win_text, reward_text, result.kl, result.num_minibatches)
+            if update % cfg.train.save_interval_steps == 0:
+                status.update(force=True, phase="saving")
+                learner.save(directory / f"ckpt_step_{update}.pt", checkpoint_state())
     except KeyboardInterrupt:
-        logger.info("收到中断，保存当前 checkpoint 后退出")
+        final_phase = "interrupted"
+        raise
+    except Exception as exc:
+        final_phase = "failed"
+        status.update(force=True, error=str(exc))
+        raise
     finally:
-        # ---- 先把未处理的异常落盘 ----
-        # close_game 可能长时间阻塞（见 env_runner.close 的看门狗说明），
-        # 若不先记录，traceback 会被压在大量日志之后甚至永远不打印
-        exc_info = sys.exc_info()
-        if exc_info[0] is not None and exc_info[0] is not KeyboardInterrupt:
-            logger.error("训练异常退出：%s: %s", exc_info[0].__name__, exc_info[1])
-            logger.error("traceback:\n%s", traceback.format_exc())
-
-        # ---- 保存最终模型 ----
-        ckpt_path = Path(cfg.train.log_dir) / "final_ckpt.pt"
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        learner.save(str(ckpt_path))
-        runner.close()
-        unified_logger.close()
-        logger.info("训练结束（共 %d 次 update）。checkpoint: %s", step + 1, ckpt_path)
-
+        status.update(force=True, phase="saving")
+        try:
+            if runner:
+                try:
+                    runner.close()
+                    if isinstance(runner, ParallelSampler):
+                        for game in runner.interrupted_episodes:
+                            append_json(directory / "interrupted_episodes.jsonl",
+                                        {"mode": "interrupted", "update": learner._total_updates, **game})
+                finally:
+                    learner.save(directory / "final_ckpt.pt", checkpoint_state())
+        except BaseException as exc:
+            final_phase = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+            status.update(force=True, error=str(exc))
+            raise
+        finally:
+            tb.close()
+            status.update(force=True, phase=final_phase, completed_updates=learner._total_updates)
+    logger.info("训练已保存：%s", directory / "final_ckpt.pt")
 
 if __name__ == "__main__":
     main()

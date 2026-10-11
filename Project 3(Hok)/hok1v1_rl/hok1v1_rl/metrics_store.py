@@ -13,6 +13,7 @@ import json
 import math
 import os
 import threading
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 
@@ -44,7 +45,7 @@ class MetricsStore:
         self.path = path
         self._lock = threading.Lock()
         parent = os.path.dirname(path)
-        if parent:
+        if parent and not read_only:
             os.makedirs(parent, exist_ok=True)
         # 训练脚本可重复运行，每次启动开启新的一段（看板按 step 排序展示）。
         # 只读方（看板）不写文件，避免往训练数据里混入会话标记。
@@ -62,7 +63,7 @@ class MetricsStore:
             step: 全局更新步数
             metrics: 键为 ``组/指标`` 的扁平 dict（值须可 JSON 序列化）
         """
-        record = {"step": int(step)}
+        record = {"step": int(step), "timestamp": datetime.now(timezone.utc).isoformat()}
         record.update(_sanitize(metrics))
         with self._lock:
             self._append_line(record)

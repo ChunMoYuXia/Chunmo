@@ -37,6 +37,25 @@ chart.html
 
 # ── Project 3(Hok)：gamecore 专有程序（含 license.dat，绝不提交）──
 Project 3(Hok)/hok_env_gamecore_*/
+Project 3(Hok)/**/hok_env_gamecore_*/
+Project 3(Hok)/**/gamecore/
+Project 3(Hok)/**/hok_env/
+Project 3(Hok)/**/rl_framework/
+Project 3(Hok)/**/license.dat
+Project 3(Hok)/**/config.json
+Project 3(Hok)/**/*.abs
+Project 3(Hok)/**/*.stat
+Project 3(Hok)/**/*.dll
+Project 3(Hok)/**/*.exe
+Project 3(Hok)/**/*.pt
+Project 3(Hok)/**/runs/
+Project 3(Hok)/**/logs_p*/
+Project 3(Hok)/**/学习笔记/
+Project 3(Hok)/**/review_*/
+.agents/
+.aws/
+.codex/
+.claude/
 
 # ── 操作系统 ────────────────────────────────────
 .DS_Store
