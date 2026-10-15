@@ -61,3 +61,18 @@ Project 3(Hok)/**/review_*/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# QuantAI source archive: keep implementation modules; ignore generated local files.
+!QuantAI/apps/client/src/lib/features/data/
+!QuantAI/apps/client/src/lib/features/data/**
+!QuantAI/apps/client/src/routes/data/
+!QuantAI/apps/client/src/routes/data/**
+QuantAI/.cache/
+QuantAI/.superpowers/
+QuantAI/.pytest_cache/
+QuantAI/.mypy_cache/
+QuantAI/.ruff_cache/
+QuantAI/runtime/
+QuantAI/backups/
+QuantAI/apps/client/.svelte-kit/
+QuantAI/apps/client/src-tauri/target/

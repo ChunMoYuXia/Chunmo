@@ -1,0 +1,9 @@
+from typing import Protocol
+
+from portfolio_client.domain.portfolio.models import PortfolioSpec, SavedPortfolio
+
+
+class PortfolioRepositoryPort(Protocol):
+    def save(self, spec: PortfolioSpec) -> SavedPortfolio: ...
+    def get(self, portfolio_id: str) -> SavedPortfolio: ...
+    def list(self) -> list[SavedPortfolio]: ...

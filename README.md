@@ -7,8 +7,15 @@
 | [Project 1(量化AI)](<Project 1(量化AI)/>) | 量化研报与多模型预测一体化平台 | Python · baostock/akshare · XGBoost/LightGBM · LLM |
 | [Project 2(ML泰坦尼克)](<Project 2(ML泰坦尼克)/>) | Kaggle Titanic 机器学习入门项目 | Python · pandas · scikit-learn |
 | [Project 3(Hok)](<Project 3(Hok)/>) | 王者荣耀 1v1 强化学习训练 | hok_env · 自研 PPO · PyTorch |
+| [QuantAI 初版归档](QuantAI/) | 本地选股、组合配置、回测与模拟交易客户端 | FastAPI · SQLAlchemy · Svelte · TypeScript · Tauri |
 
 ---
+
+## QuantAI · 股票组合研究客户端初版
+
+[QuantAI/README.md](QuantAI/README.md) 保存 2026-10-15 已验收的 M0 / v0.1.0 核心源码：CSV 与交易日历导入、历史行情、条件选股、组合优化、回测、模拟交易及可追溯报告。包含运行步骤、依赖锁、回归测试和维护脚本，不含开发环境、缓存、日志、个人数据、密钥、模型权重或安装包。
+
+这是后续统一 QuantAI 工作台的初版归档；在线下载、RAG、多模型中心和 LangChain / LangGraph 的合并开发仍在本地进行，待用户验收，不作为本归档已实现功能。本次不发布新的安装包或 Release。
 
 ## Project 1 · 量化AI（QuantAI）
 

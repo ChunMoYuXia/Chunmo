@@ -1,0 +1,49 @@
+name: Windows desktop package
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.19.0'
+      - name: Install explicit toolchains and dependencies
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --target x86_64-pc-windows-msvc
+          python -m venv .venv
+          .venv/Scripts/python -m pip install -r apps/api/requirements.lock
+          .venv/Scripts/python -m pip install --no-deps -e apps/api
+          npm ci --prefix apps/client
+          npm --prefix apps/client exec -- playwright install chromium
+      - name: Check source and build desktop installer
+        shell: pwsh
+        run: |
+          ./scripts/check.ps1
+          cargo fmt --manifest-path apps/client/src-tauri/Cargo.toml --check
+          ./scripts/build.ps1
+      - name: Verify packaged research service
+        shell: pwsh
+        run: |
+          $env:PORTFOLIO_E2E_EXECUTABLE = (Resolve-Path '.cache/sidecar/portfolio-api/portfolio-api.exe').Path
+          npm --prefix apps/client run test:e2e
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-client
+          path: |
+            apps/client/src-tauri/target/release/bundle/nsis/*-setup.exe
+            dist/stock-portfolio-client-portable.zip
+          if-no-files-found: error
+          retention-days: 14
